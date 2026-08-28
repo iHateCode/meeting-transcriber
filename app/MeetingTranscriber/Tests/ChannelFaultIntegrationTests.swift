@@ -21,6 +21,44 @@ final class ChannelFaultIntegrationTests: XCTestCase {
         ChannelHealthHarness.make()
     }
 
+    // MARK: - Providers that do not simulate capture
+
+    /// A recorder double that implements none of the optional reporting, i.e.
+    /// takes every `RecordingProvider` default.
+    private final class BareRecorder: RecordingProvider {
+        func start(source _: RecordingSource, micDeviceUID _: String?, debugLogging _: Bool) {}
+        func stop() -> RecordingResult {
+            RecordingResult(
+                mixPath: URL(fileURLWithPath: "/tmp/bare_mix.wav"),
+                appPath: nil, micPath: nil, micDelay: 0, recordingStartDate: Date(),
+            )
+        }
+    }
+
+    func testAProviderThatDoesNotSimulateCaptureIsNeverReportedAsBroken() {
+        // The protocol's defaults describe a healthy channel on purpose: a
+        // double that says nothing about capture must not make a test in an
+        // unrelated suite start posting capture-failure notifications. The
+        // sibling `AudioCapturing` deliberately has no such default, because
+        // there "said nothing" means "never opened".
+        let (controller, _, notifier, _) = makeController()
+        let bare = BareRecorder()
+
+        for offset in stride(from: 0.0, through: 300.0, by: 10.0) {
+            _ = controller.applyTick(recorder: bare, now: t0.addingTimeInterval(offset))
+        }
+
+        // Scoped to the capture titles on purpose. The same double also trips
+        // "Recording Appears Silent", because the level defaults are -120 and
+        // the symmetric monitor still decides from levels; that is untouched
+        // here and asserting on it would pin behaviour this change does not own.
+        let captureTitles = ["Capture Channel Silent", "Capture Channel Lost"]
+        XCTAssertFalse(
+            notifier.calls.contains { captureTitles.contains($0.title) },
+            "reported: \(notifier.calls.map(\.title))",
+        )
+    }
+
     // MARK: - Focus / Do Not Disturb
 
     /// The whole escalation policy, on the pure functions. The test is not "how
