@@ -28,6 +28,8 @@ final class DualSourceRecorderLifecycleTests: XCTestCase {
         var micLevelDBFS: Double = -120
         var appCaptureGaveUp = false
         var micCaptureGaveUp = false
+        var appSignalAges: ChannelSignalAges = .unknown
+        var micSignalAges: ChannelSignalAges = .unknown
         /// The configuration the recorder handed the factory, so a test can
         /// assert on the choices and write to the URLs it picked.
         var lastConfiguration: AudioCaptureConfiguration?
