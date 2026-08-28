@@ -97,9 +97,30 @@ NOISE_DBFS=-70
 # allows so the lane costs two minutes rather than six.
 WINDOW_SECONDS=30
 
+# The dev bundle has a pre-existing container at
+# `~/Library/Containers/<bundle>/…`, and macOS routes the app's UserDefaults
+# reads there whether or not this binary is sandboxed. A plain
+# `defaults write <bundle>` from outside lands in the standard domain and is
+# then silently a no-op, so this lane would run against whatever the container
+# happened to hold: a stale 90 s window makes phase 1 wait too little,
+# `autoWatch=false` means no recording at all, and a disabled indicator means
+# no monitors. Both domains are written, and both are restored. Same reasoning
+# and same shape as `_set_dev_default` in scripts/e2e-app.sh.
+CONTAINER_PLIST="$(dev_container_plist)"
+
+set_dev_default() {
+    local key="$1" value="$2" type="$3"
+    /usr/bin/defaults write "$BUNDLE_ID" "$key" "-$type" "$value" 2>/dev/null || true
+    [ -f "$CONTAINER_PLIST" ] \
+        && /usr/bin/defaults write "$CONTAINER_PLIST" "$key" "-$type" "$value" 2>/dev/null || true
+}
+
 SAVED_AUTOWATCH=""
 SAVED_THRESHOLD=""
 SAVED_INDICATOR=""
+SAVED_AUTOWATCH_CONTAINER=""
+SAVED_THRESHOLD_CONTAINER=""
+SAVED_INDICATOR_CONTAINER=""
 
 cleanup() {
     if [ -n "${NOISE_PID:-}" ] && kill -0 "$NOISE_PID" 2>/dev/null; then
@@ -116,6 +137,11 @@ cleanup() {
     restore_bool_default  "$BUNDLE_ID" autoWatch                       "$SAVED_AUTOWATCH"
     restore_float_default "$BUNDLE_ID" asymmetricSilenceWarningSeconds "$SAVED_THRESHOLD"
     restore_bool_default  "$BUNDLE_ID" perChannelIndicatorEnabled      "$SAVED_INDICATOR"
+    if [ -f "$CONTAINER_PLIST" ]; then
+        restore_bool_default  "$CONTAINER_PLIST" autoWatch                       "$SAVED_AUTOWATCH_CONTAINER"
+        restore_float_default "$CONTAINER_PLIST" asymmetricSilenceWarningSeconds "$SAVED_THRESHOLD_CONTAINER"
+        restore_bool_default  "$CONTAINER_PLIST" perChannelIndicatorEnabled      "$SAVED_INDICATOR_CONTAINER"
+    fi
     bootout_stale_launchctl
 }
 trap cleanup EXIT
@@ -191,10 +217,21 @@ done
 SAVED_AUTOWATCH="$(snapshot_default "$BUNDLE_ID" autoWatch)"
 SAVED_THRESHOLD="$(snapshot_default "$BUNDLE_ID" asymmetricSilenceWarningSeconds)"
 SAVED_INDICATOR="$(snapshot_default "$BUNDLE_ID" perChannelIndicatorEnabled)"
+if [ -f "$CONTAINER_PLIST" ]; then
+    SAVED_AUTOWATCH_CONTAINER="$(snapshot_default "$CONTAINER_PLIST" autoWatch)"
+    SAVED_THRESHOLD_CONTAINER="$(snapshot_default "$CONTAINER_PLIST" asymmetricSilenceWarningSeconds)"
+    SAVED_INDICATOR_CONTAINER="$(snapshot_default "$CONTAINER_PLIST" perChannelIndicatorEnabled)"
+fi
 
-/usr/bin/defaults write "$BUNDLE_ID" autoWatch -bool true
-/usr/bin/defaults write "$BUNDLE_ID" asymmetricSilenceWarningSeconds -float "$WINDOW_SECONDS"
-/usr/bin/defaults write "$BUNDLE_ID" perChannelIndicatorEnabled -bool true
+set_dev_default autoWatch                       true              bool
+set_dev_default asymmetricSilenceWarningSeconds "$WINDOW_SECONDS" float
+set_dev_default perChannelIndicatorEnabled      true              bool
+
+# Read back the way the app resolves it, so a domain this lane failed to reach
+# fails here rather than as a confusing timeout two minutes later.
+EFFECTIVE_WINDOW="$(read_dev_default_effective "$BUNDLE_ID" "$CONTAINER_PLIST" asymmetricSilenceWarningSeconds)"
+[ "${EFFECTIVE_WINDOW%%.*}" = "$WINDOW_SECONDS" ] \
+    || die "the app would see a ${EFFECTIVE_WINDOW}s window, not ${WINDOW_SECONDS}s — a preferences domain was not reached"
 
 # --- 3. Kill any running instance -------------------------------------------
 
