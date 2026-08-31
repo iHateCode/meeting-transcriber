@@ -59,17 +59,27 @@ Native SwiftUI menu bar application that orchestrates meeting detection, recordi
         ┌──────────────────────────────────────────────────────▼─────────┐
         │ 1. Resample to 16 kHz mono (AudioMixer; AVAsset / ffmpeg fb)   │
         │ 2. (opt) FluidVAD silence-trim + timeline remap                │
+        │ 2b. (dual-source) EchoBleedDetector: verdict on loudspeaker-   │
+        │      into-mic bleed, before either track is transcribed        │
         │ 3. Transcribe via active engine                                │
         │      └─ TranscribingEngine: WhisperKit | Parakeet             │
         │         (dual-source: each track separately, then merge)       │
+        │      └─ (opt) custom vocabulary: Parakeet CTC boosting |       │
+        │         WhisperKit decoder prompt (experimental)                │
+        │      └─ (dual-source, affected) EchoSegmentClassifier marks    │
+        │         echo-copy mic segments suppressed; dedup on merge      │
         │ 4. (opt) Diarize via FluidDiarizer                             │
         │      └─ Mode: .offline | .sortformer                           │
         │      └─ Dual-source: app + mic diarized separately,            │
         │         IDs prefixed R_ (remote) / M_ (mic), then merged       │
+        │      └─ (affected) EchoEmbeddingQuarantine holds mic-track     │
+        │         embeddings back from speakers.json                     │
         │ 5. SpeakerMatcher: cosine match against speakers.json          │
         │      (centroid + recent-FIFO, threshold 0.40, margin 0.10)     │
         │ 6. Speaker naming UI (suspended via CheckedContinuation)       │
         │ 7. Assign speakers to transcript by temporal overlap           │
+        │ 7b. (opt) TerminologyNormalizer: canonical-spelling pass       │
+        │      applied to every segment before it's saved                │
         │ 8. Save transcript (.txt)                                      │
         │ 9. Protocol generation                                         │
         │      └─ ProtocolProvider: .claudeCLI | .openAICompatible | .none│
@@ -87,11 +97,14 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 
 | File | Role |
 |------|------|
-| `MeetingTranscriberApp.swift` | `@main` UI shell — SwiftUI scenes, windows, NSOpenPanel, NSWorkspace. Observes `.showSettings` / `.closeSettings` / `.showSpeakerNaming` notifications for RPC- and pipeline-driven scene control |
+| `AppLauncher.swift` | Actual `@main` process entry point. SwiftUI's `App.main()` can't intercept its own launch, so this separate `@main` enum makes the one pre-launch decision — divert into the `--localvqe-selftest` probe or start the GUI — before any app state is constructed |
+| `MeetingTranscriberApp.swift` | SwiftUI scenes, windows, NSOpenPanel, NSWorkspace. Observes `.showSettings` / `.closeSettings` / `.showSpeakerNaming` notifications for RPC- and pipeline-driven scene control |
 | `AppState.swift` | `@Observable @MainActor` composition root — wires the concern controllers (`engines`, `watching`, `pipeline`, `permissions`, `channelHealth`, `liveTranscription`, `rpcController`) and exposes the derived UI state (badge, status label) rather than owning it |
 | `MenuBarView.swift` | Menu bar dropdown (state, actions, meeting info) |
 | `MenuBarIcon.swift` | Renders the animated waveform icon + badge overlays (permission, record-only, channel-silent) |
 | `AppPickerView.swift` | App picker sheet for manual recording of any running app |
+| `AppPickerStartState.swift` | Whether the app picker can start a recording and why not — a missing selection vs. a recording already running are not interchangeable reasons, so the view asks one value rather than assembling the message from two flags |
+| `MicrophoneRecordingAvailability.swift` | Same pattern as `AppPickerStartState.swift`, for the menu bar's "Record Microphone" item |
 | `AudioImportTypes.swift` | File types offered by the batch-import and voice-enrollment `NSOpenPanel`s — single source of truth so the ffmpeg-gated vs. natively-decoded format lists stay pinned and testable |
 | `A11yID.swift` | Shared accessibility-identifier namespace — one constant per control, referenced by the view modifier, ViewInspector tests, and the `/ui/press` allowlist |
 | `SettingsView.swift` | Settings window — `TabView` shell hosting six topic-grouped sub-views in `Sources/Settings/` |
@@ -110,6 +123,8 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `VoiceEnrollmentView.swift` | Voice enrollment sheet — seeds `speakers.json` from an existing audio file |
 | `AppSettings.swift` | `@Observable` settings persisted to UserDefaults |
 | `AppSettings+Computed.swift` | Values derived from stored `AppSettings` toggles, split out to keep `AppSettings.swift` under the line cap |
+| `AppSettings+OutputDirectory.swift` | Everything derived from `customOutputDirBookmark`, split out for the same line-cap reason |
+| `AppSettings+Vocabulary.swift` | Security-scoped custom-vocabulary-file handling (select, validate, clear) + `CustomVocabularyValidation` — shared by both ASR engines |
 | `LegacyDefaultsMigration.swift` | One-shot carry-over of settings from the pre-rename bundle identifier, since `UserDefaults` is scoped per identifier |
 | `UpdateChecker.swift` | Checks GitHub releases for newer versions, drives the menu bar update badge |
 | `Settings/PickerLanguages.swift` | Language picker entries for WhisperKit and Parakeet language selectors |
@@ -130,25 +145,41 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `MeetingDetector.swift` | Window title polling, pattern matching, confirmation counting, cooldown |
 | `MeetingTitleMatcher.swift` | Compiled idle/meeting title regex semantics for one `AppMeetingPattern` |
 | `PowerAssertionDetector.swift` | IOKit power assertion–based meeting detection (sandbox-safe); carries the Chrome WebRTC pattern for browser meetings (issue #503) |
+| `PowerAssertionDetector+Diagnostics.swift` | "Saw something meeting-shaped and did not act on it" diagnostic, split out of `PowerAssertionDetector` (line-cap) |
 | `MicInputDetector.swift` | Third `MeetingDetecting` strategy: watches which processes hold `kAudioProcessPropertyIsRunningInput` via the Core Audio process-object API — covers call apps (WeChat, Tencent Meeting, FaceTime, WhatsApp) with no reliable power-assertion signal; each app opt-in and off by default |
 | `MeetingPatterns.swift` | Regex patterns for Teams, Zoom, Webex, browser (Chrome WebRTC) |
 | `BrowserConsentPolicy.swift` | Pure decision logic for the browser-meeting "ask before recording" prompt — decline cooldown (issue #503) |
 | `ConsentAnswer.swift` | Three-way outcome of a consent prompt (yes / no / unanswered) — kept distinct from a `Bool` so a decline and a timeout get different re-prompt cooldowns (issue #543) |
+| `ConsentDenyList.swift` | Persisted "Never for this app" answers (issue #503 follow-up) — the one durable consent answer, checked before the decline cooldown so no elapsed time revives the question |
 | `BrowserConsentReadiness.swift` | Whether a browser-meeting consent prompt can actually reach the user — polls `NotificationVisibility` since the prompt is itself a notification and a broken notification channel can't report its own brokenness |
 | `ConsentPromptCoordinator.swift` | Coordinates an async yes/no recording-consent prompt: register pending decision by id, resolve once via answer or timeout |
 | `WatchLoop+Consent.swift` | Browser-meeting consent gate, split out of `WatchLoop`; only patterns with `requiresRecordingConsent` reach it |
 | `DualSourceRecorder.swift` | Orchestrates AudioTapLib capture + mic, mixes tracks |
+| `DualSourceRecorder+BuildRecording.swift` | Turns a finished capture session into the files the pipeline consumes, split out of `DualSourceRecorder` (line-cap) |
+| `RecordingSource.swift` | What a single recording captures (app tap / mic / both) — replaces an `(appPID, noMic)` pair that couldn't represent "mic only, no app tap" (issue #633) without also allowing "neither" |
 | `RecordingProvider.swift` | Protocol abstraction over `DualSourceRecorder` for mock injection in `WatchLoop` tests |
+| `ManualRecordingRequest.swift` | What the user asked `WatchingController` to record by hand — the app-picker and mic-only menu entries differ only in target, so the shared start/stop body takes this as a parameter |
+| `ManualRecordingInfo.swift` | Info about a manually started recording session, as opposed to one a detector started |
 | `WatchLoop+RecordOnly.swift` | Record-only output branch (moves WAVs + writes `RecordingSidecar`), split out of `WatchLoop` |
+| `WatchLoop+ManualRecording.swift` | The poll loop that decides when a manually started recording ends, split out of `WatchLoop` (line-cap) |
 | `AudioPersistencePolicy.swift` | Decides per finished-job source file whether to relocate it into the output folder or leave it in place (staging-dir recording vs. user-picked import) |
 | `TranscribingEngine.swift` | `TranscribingEngine` protocol + `mergeDualSourceSegments` default impl |
 | `WhisperKitEngine.swift` | WhisperKit transcription engine (99+ languages, ~1 GB model) |
+| `WhisperDecodingClient.swift` | Narrow decode boundary used by `WhisperKitEngine` — production forwards to WhisperKit, tests capture the exact options without loading a CoreML model |
+| `WhisperVocabularyPrompt.swift` | Converts the shared custom-vocabulary file into a bounded WhisperKit decoder prompt (experimental, opt-in); caches prepared tokens per model + file revision |
 | `ParakeetEngine.swift` | NVIDIA Parakeet TDT v3 via FluidAudio (25 EU languages, ~50 MB, ~10× faster) |
 | `ParakeetTokenGrouping.swift` | Pure token-grouping logic extracted from `ParakeetEngine` (testable) |
+| `ParakeetVocabularyConfiguration.swift` | Identity of one Parakeet CTC-boosting vocabulary configuration (path + bookmark + file revision) and its preparation lifecycle — a failed preparation is terminal per revision so it isn't retried every recording window |
+| `VocabularyFileAccess.swift` | Resolves persisted sandbox access for the shared custom-vocabulary file and brackets each read with the matching security scope |
 | `StreamingTranscriber.swift` | Per-channel live transcription actor (FluidVAD streaming → `engine.transcribeSamples` → partial/final captions) |
 | `PipelineQueue.swift` | Decouples recording from post-processing, sequential job pipeline |
 | `PipelineQueue+Stages.swift` | Per-stage job processing (transcribe → diarize → naming → protocol), split out of `PipelineQueue` (line-cap) |
 | `PipelineQueue+Recovery.swift` | Snapshot restore and orphaned-recording recovery for `PipelineQueue` |
+| `PipelineQueue+EchoBleed.swift` | Wires `EchoBleedDetector` into the transcribe stage, off the main actor (issue #581) |
+| `EchoBleedDetector.swift` | Detects loudspeaker-into-microphone bleed on dual-source recordings from per-10s-window envelope correlation; three-case verdict (`notMeasured`/`clean`/`affected`) since "not analysed" must stay distinct from "analysed and clean" |
+| `EchoSegmentClassifier.swift` | Per-microphone-segment dedup decision on an affected recording: does the app track's energy explain the segment (echo copy) or not (real speech)? Backs the transcript-dedup half of #581 |
+| `EchoEmbeddingQuarantine.swift` | Holds a mic track's speaker embeddings back from `speakers.json` on an affected recording, since `SpeakerMatcher` folds embeddings into a centroid permanently with no rollback |
+| `TerminologyNormalizer.swift` | Opt-in post-ASR canonical-spelling pass (`Canonical => variant \| variant` rules), applied to every saved transcript segment regardless of engine |
 | `PipelineJob.swift` | Pipeline job model (waiting → transcribing → diarizing → generatingProtocol → done) |
 | `PipelineSnapshot.swift` | Pure I/O helpers for persisting `PipelineQueue` jobs to disk (atomic rename) |
 | `PipelineEventLog.swift` | Append-only JSONL log of `PipelineQueue` job state transitions |
@@ -176,6 +207,9 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `EngineController.swift` | `@Observable @MainActor` engine selection + model lifecycle controller (language/vocabulary sync, preload) |
 | `PipelineController.swift` | `@Observable` controller owning `PipelineQueue` lifecycle (wired by `AppState`) |
 | `WatchingController.swift` | `@Observable` controller owning `WatchLoop` lifecycle (wired by `AppState`) |
+| `WatchingController+Detectors.swift` | Which detection strategies auto-watch runs, and how the "Apps to Watch" toggles filter them, split out of `WatchingController` (line-cap) |
+| `WatchingController+WatchControl.swift` | The `/v1/watch` control surface: meeting watching as an idempotent resource a remote caller can drive |
+| `WatchingController+RecordControl.swift` | The `/v1/record` control surface: microphone-only recording (`RecordingSource.micOnly`) as an idempotent resource |
 | `WavHeaderRepair.swift` | Repairs unfinalized WAV files from crash-interrupted recordings (RIFF/data chunk size fix) |
 | `FluidDiarizer.swift` | On-device speaker diarization via FluidAudio CoreML/ANE |
 | `FluidDiarizer+SortformerEmbeddings.swift` | Post-hoc WeSpeaker embedding extraction for Sortformer mode — overlap-excluded masks feed `SpeakerMatcher` (DiariZen-style hybrid) |
@@ -201,9 +235,14 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 |------|------|
 | `AudioMixer.swift` | Resampling, mixing, echo suppression, mute masking, WAV I/O |
 | `AudioConstants.swift` | Shared audio pipeline constants (target sample rate) |
+| `AudioCapturing.swift` | The consumer's-side-of-`AudioCaptureSession` protocol seam one recording drives, kept out of AudioTapLib since it's `DualSourceRecorder`'s view, not the capture library's own |
 | `FFmpegHelper.swift` | ffmpeg CLI detection + 16 kHz mono WAV conversion fallback for file-import formats AVAsset can't decode |
-| `MicRecorder.swift` | Microphone recording via AVAudioEngine |
 | `FluidVAD.swift` | VAD preprocessing via FluidAudio Silero v6 — silence trimming + `VadSegmentMap` timeline remapping |
+| `EchoCancelling.swift` | Abstraction-only seam for acoustic echo cancellation (removing far-end bleed from the mic track before transcription); nothing in the pipeline consumes it yet. Distinct from `AudioMixer.suppressEcho`'s RMS gate, which mutes the mic instead of cancelling the echo signal |
+| `LocalVQECanceller.swift` | `EchoCancelling` implementation over the vendored LocalVQE static library (`CLocalVQE` binary target) — owns the C context per call, drives the streaming frame API hop by hop |
+| `LocalVQEModel.swift` | Resolves the LocalVQE AEC model from the app bundle (2.9 MB, bundled rather than downloaded); tolerates absence for a plain `swift build`, which carries no model |
+| `LocalVQESelftest.swift` | Hidden `--localvqe-selftest` probe verifying the statically linked library resolves its compute backend from inside a signed `.app` bundle; driven by `scripts/localvqe-bundle-check.sh`, `#if !APPSTORE` |
+| `EchoFrameChunking.swift` | Pure hop arithmetic for streaming a signal through LocalVQE's fixed 256-sample-hop frame API, extracted as a testable value type |
 | `LiveAudioResampler.swift` | Streams live `LiveAudioBuffer` through `AVAudioConverter` → 16 kHz mono Float32 (feeds `StreamingTranscriber`) |
 | `SampleRateDriftDetector.swift` | Watches actual vs declared CATap sample rate (catches USB hot-plug + HFP↔A2DP renegotiation drift) |
 | `tools/audiotap/Sources/AppAudioCapture.swift` | CATapDescription + IOProc → FileHandle |
@@ -252,6 +291,7 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `AppPaths.swift` | Centralized path constants (ipcDir, dataDir, logSubsystem, speakersDB) |
 | `AXHelper.swift` | Shared accessibility API helper (MuteDetector + ParticipantReader) |
 | `NotificationManager.swift` | macOS notifications |
+| `NotificationUrgency.swift` | Whether a notification may break through a Focus mode — two cases, not the five `UNNotificationInterruptionLevel` offers, since that's the only question the app's own notifications ever need answered |
 | `NotificationScheduling.swift` | Port over the `UNUserNotificationCenter` slice `NotificationManager` uses, so posting/registration is testable against a fake scheduler |
 | `NotificationRingBuffer.swift` | Bounded, thread-safe log of recently-posted notifications (`#if !APPSTORE`) |
 | `DateFormatter+FilenameStamp.swift` | `DateFormatter` pinned to Gregorian calendar + POSIX locale for filename timestamp stamps |
@@ -277,6 +317,8 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `RPCResourceMetrics.swift` | JSON-serializable resource-usage snapshot of the running process, backs `GET /metrics` |
 | `JobStatusDTO.swift` | Wire + persisted shape for `GET /v1/jobs/<id>` (live or terminal job status + result paths) |
 | `NamingStatusDTO.swift` | Wire shape for `GET /v1/jobs/<id>/naming` — per-speaker auto-name suggestion + speaking time + participants |
+| `WatchStatusDTO.swift` | Wire shape for `GET`/`POST /v1/watch` — the meeting-watching lifecycle as a small, stable, poll-forever-safe projection (deliberately not `/state`, which carries no compatibility promise) |
+| `RecordStatusDTO.swift` | Wire shape for `GET`/`POST /v1/record` — the microphone-recording lifecycle, same audience and shape as `WatchStatusDTO` |
 | `IdempotencyStore.swift` | Bounded FIFO map of `Idempotency-Key` → created job IDs for the `/v1` enqueue routes |
 | `TerminalJobStore.swift` | File-backed store of recent finished-job statuses (survives queue reaping + app restart) |
 | `AppSettings+RPC.swift` | Builds the read-only settings projection for the debug RPC `/state` endpoint |
@@ -295,7 +337,7 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 
 | Path | Role |
 |------|------|
-| `tools/mt-cli/` | Thin Swift client for `DebugRPCServer`. Subcommands: `state`, `healthz`, `screenshot`, `open-settings`, `close-settings`, `confirm-browser-consent`, `wav-verdict`, `seed-speaker`, `rename-speaker`, `delete-speaker`, `merge-speakers`, `ui-tree`, `ui-press`. Reads token from `~/Library/Application Support/MeetingTranscriber/.rpc-token`. Skill doc at `tools/mt-cli/skill.md`. |
+| `tools/mt-cli/` | Thin Swift client for `DebugRPCServer`. Subcommands: `state`, `healthz`, `screenshot`, `open-settings`, `close-settings`, `confirm-browser-consent`, `wav-verdict`, `seed-speaker`, `rename-speaker`, `delete-speaker`, `merge-speakers`, `ui-tree`, `ui-press`, `watch`, `record` (the latter two drive `/v1/watch` and `/v1/record` with `status`/`start`/`stop`/`toggle`). Reads token from `~/Library/Application Support/MeetingTranscriber/.rpc-token`. Skill doc at `tools/mt-cli/skill.md`. |
 | `tools/meeting-simulator/` | Test fixture: spawns a fake meeting window for E2E detection tests |
 
 ---
@@ -394,6 +436,20 @@ App temp: already 16kHz mono float32 (resampled in-IOProc at capture time)
 
 All recordings are normalized to 16kHz at capture time — no resampling needed in the pipeline.
 
+### Echo Bleed Detection & Dedup (issue #581)
+
+A dual-source recording made on loudspeakers carries the remote voices on the mic track too, so the app and mic tracks get transcribed and diarized twice over. `EchoBleedDetector` (called from the transcribe stage, off the main actor) scores 10 s windows by envelope correlation between the two tracks — a per-window share above threshold, not a whole-file correlation — centered on `micDelay` rather than zero, since the files' sample 0 aren't simultaneous. It yields a three-case verdict, `EchoVerdict` (`notMeasured` / `clean` / `affected`), reported in a job's `warnings` and structured `echo` object (`GET /v1/jobs/<id>`).
+
+On an `.affected` recording:
+- `EchoSegmentClassifier` decides per mic segment whether the app track's energy explains it (an echo copy → `.echoOnly`, marked `suppressed` and left out of the saved transcript) or someone actually spoke (`.mixed`/`.ownVoice`, kept). Segments are marked, not deleted — diarization still sees the timing.
+- `EchoEmbeddingQuarantine` holds the mic track's speaker embeddings back from `speakers.json` (in `SpeakerNamingSession.reapplySpeakerNames`), since `SpeakerMatcher` folds a confirmed embedding into a running centroid with no history — contaminated audio would otherwise be learned permanently. The app track stays admissible.
+
+Only the opening `PipelineQueue.echoBleedAnalysisSeconds` of a recording is analysed.
+
+### Echo Cancellation (seam, not wired up)
+
+`EchoCancelling` / `LocalVQECanceller` sit over a vendored LocalVQE static library (`CLocalVQE`, a checksum-pinned binary target) but nothing in the pipeline calls them yet. `LocalVQEModel` resolves the ~2.9 MB AEC model from the app bundle (`scripts/fetch-localvqe-model.sh` + `scripts/build_release.sh`, not downloaded on first use). Distinct from `AudioMixer.suppressEcho`, the RMS gate already in production, which mutes the mic instead of cancelling the echo acoustically — a consumer picks one, they don't compose. `--localvqe-selftest` (via `AppLauncher`, `#if !APPSTORE`) verifies the library resolves inside a signed bundle; driven by `scripts/localvqe-bundle-check.sh`, not wired into any CI gate yet.
+
 ---
 
 ## Transcription
@@ -436,6 +492,19 @@ All recordings are normalized to 16kHz at capture time — no resampling needed 
 
 - **Token stripping:** Regex `<\|[^|]*\|>` removes `<|startoftranscript|>`, `<|en|>`, etc.
 - **Hallucination filtering:** Skip consecutive identical segments
+
+### Custom Vocabulary & Terminology Normalization
+
+A shared one-term-per-line vocabulary file (`AppSettings.customVocabularyPath`, security-scoped via `VocabularyFileAccess`) feeds both engines differently:
+
+| | Parakeet | WhisperKit |
+|---|---|---|
+| **Mechanism** | CTC boosting (`ParakeetVocabularyConfiguration`) | Decoder prompt (`WhisperVocabularyPrompt`) |
+| **Default** | On whenever a valid file is set | Off — experimental opt-in toggle |
+| **Revision tracking** | File identity + mtime + size, so an edited file is picked up without re-reading it every job | Same `FileRevision`, cached per model + revision |
+| **Cost model** | Prepared as an optional batch enhancement; preload and live captions stay unaffected | Bounded to a 32-token prompt budget (WhisperKit 1.1.0's 224-token decoder context is shared with generated tokens) |
+
+Separately, **terminology normalization** (`TerminologyNormalizer`, `AppSettings.terminologyRulesText`, opt-in, rules of the form `Canonical => variant | variant`) runs as a post-ASR pass in `PipelineQueue+Stages` on every saved segment, regardless of which engine or vocabulary path produced the text — it fixes spelling/casing, not recognition.
 
 ---
 
@@ -665,5 +734,5 @@ The overlay lives over the *currently active* animation (idle, recording, transc
 7. **5s cooldown** — Prevents re-detecting same meeting after handling
 8. **FluidAudio on-device diarization** — Replaces Python pyannote subprocess, no external dependencies
 9. **Dual-track diarization** — App and mic tracks diarized separately, avoiding echo/cross-talk interference
-10. **Embedded debug RPC + automation API** — In-process HTTP server (`DebugRPCServer`) exposes state, resource metrics (`GET /metrics`), screenshot, and scene actions for shell-driven inspection and integration tests, plus a versioned `/v1` automation API (headless transcribe + job/naming control; reference in `docs/automation-api.md`). Off by default, opt-in via the `Settings → Advanced → Local Automation API` toggle or the `MEETINGTRANSCRIBER_DEBUG_RPC=1` env var, excluded from App Store builds via `#if !APPSTORE`. Action endpoints route through existing `Notification.Name` observers in `MeetingTranscriberApp`, so RPC-driven flows mirror real menu-bar paths.
+10. **Embedded debug RPC + automation API** — In-process HTTP server (`DebugRPCServer`) exposes state, resource metrics (`GET /metrics`), screenshot, and scene actions for shell-driven inspection and integration tests, plus a versioned `/v1` automation API (headless transcribe + job/naming control + `/v1/watch` and `/v1/record` lifecycle control; reference in `docs/automation-api.md`). Off by default, opt-in via the `Settings → Advanced → Local Automation API` toggle or the `MEETINGTRANSCRIBER_DEBUG_RPC=1` env var, excluded from App Store builds via `#if !APPSTORE`. Action endpoints route through existing `Notification.Name` observers in `MeetingTranscriberApp`, so RPC-driven flows mirror real menu-bar paths.
 11. **No expensive work in SwiftUI hot paths** — view bodies, computed properties read by the body, and per-render closures must not call disk I/O, JSON decode, factory constructors, regex compilation, or other non-trivial work. SwiftUI re-renders on every `@State`/`@Observable` change and fans out aggressively, so what looks cheap once becomes a CPU pin fast. Push heavy values up: store as `@State`, inject as a stored property, or surface via an `@Observable` model. Caches that mirror the underlying source (e.g. `PipelineQueue.knownSpeakerNames` mirroring the speakers DB) must wire invalidation from every mutation site in the same PR — see issue #155 → PR #158 → PR #159 for the cautionary tale.

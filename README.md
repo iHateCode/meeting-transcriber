@@ -86,6 +86,7 @@ flowchart TD
 - **On-device transcription** — Two engines, selectable in Settings:
   - [WhisperKit](https://github.com/argmaxinc/WhisperKit) — 99+ languages, ~1 GB model
   - [Parakeet TDT v3](https://github.com/FluidInference/FluidAudio) (NVIDIA) — 25 EU languages, ~50 MB model, ~10× faster, custom vocabulary support (CTC boosting)
+- **Custom vocabulary & terminology normalization** — A shared term list primes recognition (CTC boosting on Parakeet, an experimental decoder prompt on WhisperKit); an optional post-transcription pass then rewrites spoken variants to a canonical spelling (`Canonical => variant | variant` rules)
 - **On-device speaker diarization** — [FluidAudio](https://github.com/FluidInference/FluidAudio) via CoreML/ANE — no HuggingFace token needed; two modes: standard (`OfflineDiarizer`) and overlap-aware (`Sortformer`)
 - **Dual-track diarization** — App and mic tracks diarized separately for clean speaker separation without echo interference
 - **Speaker recognition** — Voice embeddings stored across meetings, matched via cosine similarity
