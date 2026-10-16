@@ -54,6 +54,20 @@ extension AppMeetingPattern {
             #"^Calls \|"#,
             #"^People \|"#,
             #"^Notifications \|"#,
+            // Bare tab names: Teams dropped the ` | Microsoft Teams` suffix from
+            // its window titles (seen October 2026, build 26261), so the main
+            // window now reads just `Calendar`. Anchored on both ends so a
+            // meeting that merely contains a tab word ("Calendar review") is not idle.
+            #"^Chat$"#,
+            #"^Activity$"#,
+            #"^Calendar$"#,
+            #"^Teams$"#,
+            #"^Files$"#,
+            #"^Assignments$"#,
+            #"^Settings$"#,
+            #"^Calls$"#,
+            #"^People$"#,
+            #"^Notifications$"#,
         ],
     )
 
