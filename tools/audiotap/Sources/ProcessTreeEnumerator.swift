@@ -68,7 +68,7 @@ public enum ProcessTreeEnumerator {
 
     /// `proc_pidpath` for a single PID, or nil if the kernel refuses (process
     /// exited, sandbox boundary, etc.).
-    static func liveExecutablePath(for pid: pid_t) -> String? {
+    public static func liveExecutablePath(for pid: pid_t) -> String? {
         var pathBuf = [CChar](repeating: 0, count: procPidPathMaxSize)
         let n = proc_pidpath(pid, &pathBuf, UInt32(pathBuf.count))
         guard n > 0 else { return nil }

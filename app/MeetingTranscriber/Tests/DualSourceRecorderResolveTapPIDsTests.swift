@@ -45,4 +45,66 @@ final class DualSourceRecorderResolveTapPIDsTests: XCTestCase {
         let pids = DualSourceRecorder.resolveTapPIDs(rootPID: 42, bundleURL: bundle) { _ in [100, 200] }
         XCTAssertEqual(pids, [42, 100, 200], "the root must be prepended (first), not appended")
     }
+
+    // MARK: - Helper root promoted to its owning app
+
+    private let firefox = URL(fileURLWithPath: "/Applications/Firefox.app")
+    private let helperPath = "/Applications/Firefox.app/Contents/MacOS/gpu-helper.app/Contents/MacOS/Firefox GPU Helper"
+
+    /// A browser's WebRTC power assertion can be held by a helper that lives in
+    /// its own nested `.app`. Enumerating that helper's bundle finds the helper
+    /// alone, which has no audio object, so the tap throws "Failed to translate
+    /// any of 1 PIDs". The root must move up to the owning app.
+    func testEffectiveRootPromotesNestedHelperToResponsibleApp() {
+        let root = DualSourceRecorder.effectiveRootPID(
+            rootPID: 50,
+            responsibleFor: { _ in 10 },
+            bundleURLOf: { $0 == 10 ? self.firefox : nil },
+            executablePath: { _ in self.helperPath },
+        )
+        XCTAssertEqual(root, 10)
+    }
+
+    /// A process a shell launched is attributed to the terminal, which is a
+    /// running app but does not contain it: widening there would tap the terminal.
+    func testEffectiveRootKeepsRootWhenOwnerDoesNotContainIt() {
+        let root = DualSourceRecorder.effectiveRootPID(
+            rootPID: 50,
+            responsibleFor: { _ in 10 },
+            bundleURLOf: { _ in URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app") },
+            executablePath: { _ in "/usr/local/bin/some-tool" },
+        )
+        XCTAssertEqual(root, 50)
+    }
+
+    func testEffectiveRootKeepsRootWhenItOwnsItself() {
+        let root = DualSourceRecorder.effectiveRootPID(
+            rootPID: 50,
+            responsibleFor: { $0 },
+            bundleURLOf: { _ in self.firefox },
+            executablePath: { _ in self.helperPath },
+        )
+        XCTAssertEqual(root, 50)
+    }
+
+    func testEffectiveRootKeepsRootWhenResponsibilityUnknown() {
+        let root = DualSourceRecorder.effectiveRootPID(
+            rootPID: 50,
+            responsibleFor: { _ in 0 },
+            bundleURLOf: { _ in self.firefox },
+            executablePath: { _ in self.helperPath },
+        )
+        XCTAssertEqual(root, 50)
+    }
+
+    /// `/Applications/Firefox.app` must not claim `/Applications/Firefox.appx/...`.
+    func testEffectiveRootMatchesBundleAsDirectoryPrefix() {
+        let root = DualSourceRecorder.effectiveRootPID(
+            rootPID: 50,
+            responsibleFor: { _ in 10 },
+            bundleURLOf: { _ in self.firefox },
+            executablePath: { _ in "/Applications/Firefox.appx/Contents/MacOS/x" },
+        )
+        XCTAssertEqual(root, 50)
+    }
 }
